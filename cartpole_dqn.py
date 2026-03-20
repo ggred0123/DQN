@@ -1,3 +1,6 @@
+import os
+os.environ["SDL_AUDIODRIVER"] = "dummy"  # soundcard error log
+
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 import torch
@@ -7,6 +10,20 @@ import random
 import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
+import shutil
+import glob
+
+
+SEED = 42
+
+def set_seed(seed):
+    """Set seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class DQN(nn.Module):
@@ -92,6 +109,17 @@ def running_DQL(env, M, T, gamma=0.99, lr=1e-4, batch_size=128,
     epsilon = eps_start
     total_steps = 0
 
+    # --- Record ALL episodes, keep only the best video at the end ---
+    all_videos_folder = "all_videos"
+    if os.path.exists(all_videos_folder):
+        shutil.rmtree(all_videos_folder)
+
+    # Close the original env and recreate with recording
+    env.close()
+    env = gym.make('CartPole-v1', max_episode_steps=500, render_mode="rgb_array")
+    env = RecordVideo(env, video_folder=all_videos_folder,
+                      episode_trigger=lambda x: True, disable_logger=True)
+
     for episode in range(1, M + 1):
         # Reset environment and get initial state: s1 = {x1}, phi1 = phi(s1)
         state, _ = env.reset()
@@ -129,9 +157,10 @@ def running_DQL(env, M, T, gamma=0.99, lr=1e-4, batch_size=128,
                     targets = r_batch + gamma * max_next_q * (1.0 - d_batch)
 
                 # Perform gradient descent step on (y_j - Q(phi_j, a_j; theta))^2
-                loss = nn.functional.mse_loss(q_values, targets)
+                loss = nn.functional.smooth_l1_loss(q_values, targets)
                 optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=100)
                 optimizer.step()
 
             if done:
@@ -141,10 +170,11 @@ def running_DQL(env, M, T, gamma=0.99, lr=1e-4, batch_size=128,
         duration = t
         episode_durations.append(duration)
 
-        # Track the best episode (longest survival)
+        # Track the best episode
         if duration > max_duration:
             max_duration = duration
             best_episode = episode
+            print(f"  >> New best! Episode {episode}: {duration} steps")
 
         # Gradually decay epsilon
         epsilon = max(eps_end, epsilon * eps_decay)
@@ -156,29 +186,35 @@ def running_DQL(env, M, T, gamma=0.99, lr=1e-4, batch_size=128,
         if episode % 20 == 0:
             avg = np.mean(episode_durations[-20:])
             print(f"Episode {episode}/{M} | Duration: {duration} | "
-                  f"Avg(20): {avg:.1f} | Max: {max_duration} | Eps: {epsilon:.4f}")
+                  f"Avg(20): {avg:.1f} | Max: {max_duration} (ep {best_episode}) | Eps: {epsilon:.4f}")
 
     env.close()
 
-    # --- Record video of the best-performing episode using the trained agent ---
-    print(f"\nTraining complete. Best episode: {best_episode} with {max_duration} steps.")
-    print("Recording video of trained agent...")
+    # --- Extract the best episode video ---
+    # RecordVideo names files as rl-video-episode-{index}.mp4 (0-indexed)
+    best_video_index = best_episode - 1
+    best_video_file = os.path.join(all_videos_folder, f"rl-video-episode-{best_video_index}.mp4")
 
-    video_env = gym.make('CartPole-v1', max_episode_steps=500, render_mode="rgb_array")
-    video_env = RecordVideo(video_env, video_folder="best_video",
-                            episode_trigger=lambda x: True, disable_logger=True)
+    final_folder = "best_video"
+    if os.path.exists(final_folder):
+        shutil.rmtree(final_folder)
+    os.makedirs(final_folder)
 
-    state, _ = video_env.reset()
-    state = torch.tensor(state, dtype=torch.float32)
-    for t in range(1, T + 1):
-        action = select_action(state, policy_net, 0.0, action_dim)  # greedy (no exploration)
-        next_state, reward, terminated, truncated, _ = video_env.step(action)
-        done = terminated or truncated
-        state = torch.tensor(next_state, dtype=torch.float32)
-        if done:
-            print(f"Video episode lasted {t} steps.")
-            break
-    video_env.close()
+    if os.path.exists(best_video_file):
+        shutil.copy2(best_video_file, os.path.join(final_folder, "best_episode.mp4"))
+        print(f"\nBest episode {best_episode} ({max_duration} steps) video saved to '{final_folder}/best_episode.mp4'")
+    else:
+        print(f"\nWarning: Could not find video file for episode {best_episode}")
+        # List available files for debugging
+        available = sorted(glob.glob(os.path.join(all_videos_folder, "*.mp4")))
+        print(f"Available videos: {len(available)} files")
+        if available:
+            # Copy the last available as fallback
+            shutil.copy2(available[-1], os.path.join(final_folder, "best_episode.mp4"))
+            print(f"Copied fallback: {available[-1]}")
+
+    # Clean up all recorded videos
+    shutil.rmtree(all_videos_folder)
 
     # --- Save performance graph ---
     plt.figure(figsize=(10, 5))
@@ -197,7 +233,9 @@ def main():
     # Create CartPole environment
     # Action space: env.action_space.n (2: push cart to the left, push cart to the right)
     # State space: env.observation_space.shape (4: cart pos, cart vel, pole angle, pole ang vel)
+    set_seed(SEED)
     env = gym.make('CartPole-v1', max_episode_steps=500)
+    env.reset(seed=SEED)
 
     M = 400   # number of episodes
     T = 500   # max time steps per episode
